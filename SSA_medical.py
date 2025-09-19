@@ -1,473 +1,526 @@
-# Import necessary libraries
-import os
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split, cross_val_score, validation_curve
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import (accuracy_score, recall_score, precision_score, 
+                            f1_score, roc_auc_score, confusion_matrix, 
+                            classification_report, roc_curve, auc)
+import seaborn as sns
+import os
+import json
 import time
 from collections import Counter
-from sklearn.model_selection import train_test_split, GridSearchCV, cross_val_score, StratifiedKFold
 from sklearn.preprocessing import StandardScaler
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import (roc_auc_score, accuracy_score, confusion_matrix,
-                             classification_report, precision_score, recall_score, f1_score, roc_curve)
-from sklearn.pipeline import Pipeline
-from sklearn.feature_selection import SelectKBest, f_classif
 from imblearn.over_sampling import SMOTE
-from imblearn.pipeline import Pipeline as ImbPipeline
-import joblib
+from sklearn.model_selection import StratifiedKFold
 import xgboost as xgb
-import warnings
 
-warnings.filterwarnings('ignore')
+# Create directory for saving results
+timestamp = time.strftime("%Y%m%d_%H%M%S")
+results_dir = f"results_{timestamp}"
+os.makedirs(results_dir, exist_ok=True)
 
-# Ensure results directory exists
-if not os.path.exists('../results'):
-    os.makedirs('../results')
+def save_hyperparameters(params, filename):
+    """Save hyperparameters to JSON file"""
+    with open(os.path.join(results_dir, filename), 'w') as f:
+        json.dump(params, f, indent=4)
 
-
-# =============================================================
-# Helper functions: save parameters, evaluation metrics and confusion matrix
-# =============================================================
-def save_parameters(filename, params, model_type):
-    """Save parameters to file"""
-    with open(filename, 'w') as f:
-        f.write(f"{model_type} Parameters:\n")
-        for key, value in params.items():
-            f.write(f"{key}: {value}\n")
-
-
-def save_evaluation_metrics(filename, metrics, prefix=""):
-    """Save evaluation metrics to file"""
-    with open(filename, 'a') as f:
-        f.write(f"\n{prefix} Evaluation Metrics:\n")
-        for key, value in metrics.items():
-            f.write(f"{key}: {value:.4f}\n")
-
-
-def plot_and_save_confusion_matrix(y_true, y_pred, filename, title="Confusion Matrix", dpi=400):
-    """Plot and save confusion matrix"""
+def save_confusion_matrix(y_true, y_pred, model_name, title, dpi=400):
+    """Generate and save confusion matrix"""
     cm = confusion_matrix(y_true, y_pred)
     plt.figure(figsize=(8, 6))
-    plt.imshow(cm, interpolation='nearest', cmap=plt.cm.Blues)
-    plt.title(title)
-    plt.colorbar()
-
-    classes = ["0", "1"]
-    tick_marks = np.arange(len(classes))
-    plt.xticks(tick_marks, classes)
-    plt.yticks(tick_marks, classes)
-
-    thresh = cm.max() / 2.
-    for i in range(cm.shape[0]):
-        for j in range(cm.shape[1]):
-            plt.text(j, i, format(cm[i, j], 'd'),
-                     horizontalalignment="center",
-                     color="white" if cm[i, j] > thresh else "black")
-
-    plt.ylabel('True label')
-    plt.xlabel('Predicted label')
-    plt.tight_layout()
-    plt.savefig(filename, dpi=dpi, format='jpg')
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
+                xticklabels=['Predicted 0', 'Predicted 1'],
+                yticklabels=['Actual 0', 'Actual 1'])
+    plt.title(f'Confusion Matrix - {title}')
+    plt.xlabel('Predicted Label')
+    plt.ylabel('True Label')
+    plt.savefig(os.path.join(results_dir, f'confusion_matrix_{model_name}.jpg'), dpi=dpi)
     plt.close()
 
+def save_roc_curve(y_true, y_pred_proba, model_name, title, dpi=400):
+    """Generate and save ROC curve"""
+    fpr, tpr, _ = roc_curve(y_true, y_pred_proba)
+    roc_auc = auc(fpr, tpr)
+    
+    plt.figure(figsize=(8, 6))
+    plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (area = {roc_auc:.2f})')
+    plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
+    plt.xlim([0.0, 1.0])
+    plt.ylim([0.0, 1.05])
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+    plt.title(f'ROC Curve - {title}')
+    plt.legend(loc="lower right")
+    plt.savefig(os.path.join(results_dir, f'roc_curve_{model_name}.jpg'), dpi=dpi)
+    plt.close()
 
-def evaluate_model_final(pipeline, X_train, X_test, y_train, y_test, model_name):
-    """Evaluate final model performance on held-out test set"""
-    # Fit on training data
-    pipeline.fit(X_train, y_train)
+def save_convergence_curve(fitness_history, model_name, title, dpi=400):
+    """Plot and save convergence curve"""
+    plt.figure(figsize=(10, 6))
+    plt.plot(fitness_history, 'b-', linewidth=2)
+    plt.title(f'Convergence Curve - {title}')
+    plt.xlabel('Iteration')
+    plt.ylabel('Fitness (Error Rate)')
+    plt.grid(True)
+    plt.savefig(os.path.join(results_dir, f'convergence_{model_name}.jpg'), dpi=dpi)
+    plt.close()
 
-    # Predict on test set
-    y_pred = pipeline.predict(X_test)
-    y_pred_proba = pipeline.predict_proba(X_test)[:, 1]
-
+def evaluate_model(model, X, y, model_name, title):
+    """Evaluate model and save results"""
+    y_pred = model.predict(X)
+    y_pred_proba = model.predict_proba(X)[:, 1]
+    
     # Calculate metrics
-    metrics = {
-        'accuracy': accuracy_score(y_test, y_pred),
-        'precision': precision_score(y_test, y_pred, average='weighted'),
-        'recall': recall_score(y_test, y_pred, average='weighted'),
-        'f1': f1_score(y_test, y_pred, average='weighted'),
-        'auc': roc_auc_score(y_test, y_pred_proba)
+    accuracy = accuracy_score(y, y_pred)
+    recall = recall_score(y, y_pred)
+    precision = precision_score(y, y_pred)
+    f1 = f1_score(y, y_pred)
+    roc_auc = roc_auc_score(y, y_pred_proba)
+    
+    # Print metrics
+    print(f"\n{title} - {model_name} Performance:")
+    print(f"Accuracy: {accuracy:.4f}")
+    print(f"Recall: {recall:.4f}")
+    print(f"Precision: {precision:.4f}")
+    print(f"F1 Score: {f1:.4f}")
+    print(f"ROC AUC: {roc_auc:.4f}")
+    print("\nClassification Report:")
+    print(classification_report(y, y_pred, digits=4))
+    
+    # Save confusion matrix and ROC curve
+    save_confusion_matrix(y, y_pred, f"{model_name}_{title.lower()}", title)
+    save_roc_curve(y, y_pred_proba, f"{model_name}_{title.lower()}", title)
+    
+    return {
+        'accuracy': accuracy,
+        'recall': recall,
+        'precision': precision,
+        'f1': f1,
+        'roc_auc': roc_auc
     }
 
-    print(f"\n{model_name} Final Test Performance:")
-    for metric, value in metrics.items():
-        print(f"{metric.capitalize()}: {value:.4f}")
+# SSA (Salp Swarm Algorithm) Optimizer Implementation
+class SalpSwarmOptimizer:
+    def __init__(self, n_salps, dim, bounds, max_iter, leader_init=None):
+        """
+        Initialize SSA optimizer
+        n_salps: Number of salps
+        dim: Problem dimension
+        bounds: Parameter bounds
+        max_iter: Maximum iterations
+        leader_init: Initial leader position
+        """
+        self.n_salps = n_salps
+        self.dim = dim
+        self.bounds = np.array(bounds)
+        self.max_iter = max_iter
 
-    return metrics, y_pred, pipeline
+        # Initialize salp positions
+        self.salps = np.zeros((n_salps, dim))
+        for i in range(dim):
+            min_bound, max_bound = self.bounds[i]
+            self.salps[:, i] = np.random.uniform(min_bound, max_bound, n_salps)
+        
+        # Set leader initial position
+        if leader_init is not None:
+            self.salps[0, :] = leader_init
 
+        # Store best position and fitness
+        self.best_position = None
+        self.best_fitness = float('inf')
+        self.fitness_history = []  # Record best fitness for each iteration
+        self.initial_fitness = None  # Record initial fitness
+
+    def optimize(self, fitness_func):
+        """Execute optimization process"""
+        # Evaluate initial population
+        fitness = np.zeros(self.n_salps)
+        for i in range(self.n_salps):
+            fitness[i] = fitness_func(self.salps[i, :])
+            if fitness[i] < self.best_fitness:
+                self.best_fitness = fitness[i]
+                self.best_position = self.salps[i, :].copy()
+        
+        # Record initial fitness
+        self.initial_fitness = fitness[0]
+        self.fitness_history.append(self.best_fitness)
+        print(f"Initial fitness: {self.initial_fitness:.4f}")
+
+        # Start optimization iterations
+        for t in range(self.max_iter):
+            # Update convergence factor c1
+            c1 = 2 * np.exp(-(4 * t / self.max_iter) ** 2)
+
+            # Update leader position
+            for i in range(self.dim):
+                c2 = np.random.random()
+                c3 = np.random.random()
+
+                if c3 < 0.5:
+                    self.salps[0, i] = self.best_position[i] + c1 * (
+                            (self.bounds[i, 1] - self.bounds[i, 0]) * c2 + self.bounds[i, 0])
+                else:
+                    self.salps[0, i] = self.best_position[i] - c1 * (
+                            (self.bounds[i, 1] - self.bounds[i, 0]) * c2 + self.bounds[i, 0])
+
+                # Ensure position is within bounds
+                self.salps[0, i] = np.clip(
+                    self.salps[0, i], self.bounds[i, 0], self.bounds[i, 1]
+                )
+
+            # Update follower positions
+            for i in range(1, self.n_salps):
+                for j in range(self.dim):
+                    self.salps[i, j] = 0.5 * (self.salps[i, j] + self.salps[i - 1, j])
+
+            # Evaluate new positions and update best solution
+            for i in range(self.n_salps):
+                fitness[i] = fitness_func(self.salps[i, :])
+                if fitness[i] < self.best_fitness:
+                    self.best_fitness = fitness[i]
+                    self.best_position = self.salps[i, :].copy()
+
+            self.fitness_history.append(self.best_fitness)
+
+            # Print progress
+            if (t + 1) % 5 == 0:
+                print(f"Iteration {t + 1}/{self.max_iter}, Best Fitness: {self.best_fitness:.4f}")
+
+        return self.best_position, self.best_fitness
 
 # =============================================================
-# Data loading and preprocessing
+# Data Loading and Preprocessing
 # =============================================================
+# Load your dataset here
+# Please replace this with your own dataset path
+print("Please load your dataset here. Replace the following lines with your data loading code:")
+print("df = pd.read_csv('your_dataset.csv')")
+print("Make sure your dataset has a target column named 'output' for binary classification")
 
-def load_and_split_data():
-    """Load data and perform initial train/test split ONLY"""
-    # Data loading - Please replace with your own dataset path
-    # Note: Replace the following paths with your actual dataset paths
-    print("Loading dataset...")
-    print("Please replace 'your_dataset.csv' with your actual dataset path")
+# Example dataset loading (replace with your own)
+# df = pd.read_csv('your_dataset.csv', encoding='utf-8_sig')
 
-    # For demonstration - replace with your actual data loading
-    # df = pd.read_csv('your_dataset.csv')  # Please use your dataset file
+# For demonstration purposes, create a sample dataset structure
+# Remove this section and use your actual dataset
+np.random.seed(42)
+n_samples = 1000
+n_features = 20
 
-    # Creating a sample dataset for demonstration
-    # Remove this section and use your actual data loading code
-    np.random.seed(42)
-    n_samples, n_features = 1000, 20
-    X_demo = np.random.randn(n_samples, n_features)
-    y_demo = np.random.choice([0, 1], size=n_samples, p=[0.7, 0.3])
+# Create sample data
+X_sample = np.random.randn(n_samples, n_features)
+y_sample = np.random.choice([0, 1], size=n_samples, p=[0.8, 0.2])  # Imbalanced dataset
 
-    feature_names = [f'feature_{i}' for i in range(n_features)]
-    df = pd.DataFrame(X_demo, columns=feature_names)
-    df['target'] = y_demo
-    # End of demonstration data - replace with your actual data
+# Create DataFrame
+feature_names = [f'feature_{i+1}' for i in range(n_features)]
+df = pd.DataFrame(X_sample, columns=feature_names)
+df['output'] = y_sample
 
-    print(f"Dataset shape: {df.shape}")
-    print(f"Target distribution:\n{df['target'].value_counts()}")
+print(f"Dataset shape: {df.shape}")
+print(f"Target distribution: {Counter(df['output'])}")
 
-    # Split features and target
-    X = df.drop('target', axis=1)  # Modify according to your target column name
-    y = df['target']  # Modify according to your target column name
+# Split data into train, validation, and test sets (64%/16%/20%)
+X = df.drop('output', axis=1)
+y = df['output']
 
-    # ONLY split into train and test - validation will be handled by CV
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42, stratify=y
+# First split: train+val vs test (80% vs 20%)
+X_temp, X_test, y_temp, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=42, stratify=y
+)
+
+# Second split: train vs val (64% vs 16% of total data)
+# Since we have 80% left, we need 64/80 = 0.8 for train and 16/80 = 0.2 for validation
+X_train, X_val, y_train, y_val = train_test_split(
+    X_temp, y_temp, test_size=0.2, random_state=42, stratify=y_temp
+)
+
+print(f"Training set size: {len(X_train)}")
+print(f"Validation set size: {len(X_val)}")
+print(f"Test set size: {len(X_test)}")
+
+# Standardize data
+scaler = StandardScaler()
+X_train_scaled = scaler.fit_transform(X_train)
+X_val_scaled = scaler.transform(X_val)
+X_test_scaled = scaler.transform(X_test)
+
+# Use SMOTE for oversampling on training data only
+smote = SMOTE(random_state=42)
+X_train_resampled, y_train_resampled = smote.fit_resample(X_train_scaled, y_train)
+print('Class distribution before oversampling:', Counter(y_train))
+print('Class distribution after oversampling:', Counter(y_train_resampled))
+
+# =============================================================
+# 1. SSA-Optimized Random Forest Model
+# =============================================================
+# Define Random Forest fitness function using new loss function
+def rf_fitness(position):
+    """Calculate Random Forest loss function with given parameters"""
+    n_estimators = int(position[0])
+    max_depth = int(position[1]) if position[1] >= 1 else None
+    min_samples_split = int(position[2])
+    min_samples_leaf = int(position[3])
+
+    # Create Random Forest model
+    rf = RandomForestClassifier(
+        n_estimators=n_estimators,
+        max_depth=max_depth,
+        min_samples_split=min_samples_split,
+        min_samples_leaf=min_samples_leaf,
+        random_state=42,
+        n_jobs=-1
     )
 
-    print(f"Training set size: {X_train.shape}")
-    print(f"Test set size: {X_test.shape}")
-    print(f"Training set target distribution: {Counter(y_train)}")
-    print(f"Test set target distribution: {Counter(y_test)}")
+    # Use 5-fold cross-validation to calculate accuracy and recall
+    acc_scores = cross_val_score(rf, X_train_resampled, y_train_resampled, cv=5, scoring='accuracy')
+    recall_scores = cross_val_score(rf, X_train_resampled, y_train_resampled, cv=5, scoring='recall')
+    
+    # Calculate mean accuracy and recall
+    mean_accuracy = np.mean(acc_scores)
+    mean_recall = np.mean(recall_scores)
+    
+    # Calculate new loss function (weighted combination)
+    loss = (1 - mean_recall) * 0.8 + (1 - mean_accuracy) * 0.2
+    return loss
 
-    return X_train, X_test, y_train, y_test, X.columns.tolist()
+# Set Random Forest leader initial parameters
+rf_leader_init = [100, 10, 4, 1]  # n_estimators, max_depth, min_samples_split, min_samples_leaf
 
+# Save initial parameters
+initial_rf_params = {
+    'n_estimators': rf_leader_init[0],
+    'max_depth': rf_leader_init[1],
+    'min_samples_split': rf_leader_init[2],
+    'min_samples_leaf': rf_leader_init[3]
+}
+save_hyperparameters(initial_rf_params, 'initial_rf_params.json')
 
-# =============================================================
-# Pipeline Creation with Proper Data Leakage Prevention
-# =============================================================
+# SSA parameter settings
+print("\nStarting Random Forest parameter optimization...")
+rf_ssa = SalpSwarmOptimizer(
+    n_salps=10,
+    dim=4,
+    bounds=[(50, 200), (3, 20), (2, 10), (1, 5)],  # n_estimators, max_depth, min_samples_split, min_samples_leaf
+    max_iter=20,
+    leader_init=rf_leader_init
+)
 
-def create_rf_pipeline():
-    """Create Random Forest pipeline with all preprocessing steps"""
-    pipeline = ImbPipeline([
-        ('feature_selection', SelectKBest(f_classif)),  # Feature selection within CV
-        ('scaler', StandardScaler()),  # Scaling within CV
-        ('smote', SMOTE(random_state=42)),  # Resampling within CV
-        ('classifier', RandomForestClassifier(random_state=42, n_jobs=-1))
-    ])
-    return pipeline
+# Train initial model
+initial_rf = RandomForestClassifier(
+    n_estimators=rf_leader_init[0],
+    max_depth=rf_leader_init[1],
+    min_samples_split=rf_leader_init[2],
+    min_samples_leaf=rf_leader_init[3],
+    random_state=42,
+    n_jobs=-1
+)
+initial_rf.fit(X_train_resampled, y_train_resampled)
 
+# Evaluate initial model on validation set
+print("\nInitial Random Forest model performance on validation set:")
+initial_rf_val_metrics = evaluate_model(initial_rf, X_val_scaled, y_val, 'rf', 'Initial RF Validation')
 
-def create_xgb_pipeline():
-    """Create XGBoost pipeline with all preprocessing steps"""
-    pipeline = ImbPipeline([
-        ('feature_selection', SelectKBest(f_classif)),  # Feature selection within CV
-        ('scaler', StandardScaler()),  # Scaling within CV
-        ('smote', SMOTE(random_state=42)),  # Resampling within CV
-        ('classifier', xgb.XGBClassifier(random_state=42, n_jobs=-1, eval_metric='logloss'))
-    ])
-    return pipeline
+# Evaluate initial model on test set
+print("\nInitial Random Forest model performance on test set:")
+initial_rf_test_metrics = evaluate_model(initial_rf, X_test_scaled, y_test, 'rf', 'Initial RF Test')
 
+# Execute optimization
+start_time = time.time()
+best_rf_params, best_rf_fitness = rf_ssa.optimize(rf_fitness)
+elapsed_time = time.time() - start_time
 
-# =============================================================
-# Nested Cross-Validation with Grid Search
-# =============================================================
+# Parse best parameters
+n_estimators = int(best_rf_params[0])
+max_depth = int(best_rf_params[1]) if best_rf_params[1] >= 1 else None
+min_samples_split = int(best_rf_params[2])
+min_samples_leaf = int(best_rf_params[3])
 
-def perform_nested_cv_gridsearch(X_train, y_train, feature_names):
-    """Perform nested cross-validation with grid search to prevent data leakage"""
+# Save optimized parameters
+optimized_rf_params = {
+    'n_estimators': n_estimators,
+    'max_depth': max_depth,
+    'min_samples_split': min_samples_split,
+    'min_samples_leaf': min_samples_leaf,
+    'fitness': best_rf_fitness
+}
+save_hyperparameters(optimized_rf_params, 'optimized_rf_params.json')
 
-    print("\n" + "=" * 60)
-    print("NESTED CROSS-VALIDATION WITH GRID SEARCH")
-    print("=" * 60)
-    print("Outer CV: Model evaluation (5-fold)")
-    print("Inner CV: Hyperparameter optimization (3-fold)")
-    print("All preprocessing (scaling, SMOTE, feature selection) done within CV folds")
+print("\nRandom Forest optimization completed!")
+print(f"Optimization time: {elapsed_time:.2f} seconds")
+print(f"Best parameters: n_estimators={n_estimators}, max_depth={max_depth}, "
+      f"min_samples_split={min_samples_split}, min_samples_leaf={min_samples_leaf}")
+print(f"Best fitness value: {best_rf_fitness:.4f}")
 
-    # Define cross-validation strategies
-    outer_cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-    inner_cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
+# Train final model with best parameters
+optimized_rf = RandomForestClassifier(
+    n_estimators=n_estimators,
+    max_depth=max_depth,
+    min_samples_split=min_samples_split,
+    min_samples_leaf=min_samples_leaf,
+    random_state=42,
+    n_jobs=-1
+)
+optimized_rf.fit(X_train_resampled, y_train_resampled)
 
-    # Define models and parameter grids
-    models_config = {
-        'Random Forest': {
-            'pipeline': create_rf_pipeline(),
-            'param_grid': {
-                'feature_selection__k': [10, 15, 20],  # Number of features to select
-                'classifier__n_estimators': [100, 200],
-                'classifier__max_depth': [10, 20, None],
-                'classifier__min_samples_split': [2, 5],
-                'classifier__min_samples_leaf': [1, 2],
-                'classifier__max_features': ['sqrt', 'log2']
-            }
-        },
-        'XGBoost': {
-            'pipeline': create_xgb_pipeline(),
-            'param_grid': {
-                'feature_selection__k': [10, 15, 20],  # Number of features to select
-                'classifier__n_estimators': [100, 200],
-                'classifier__max_depth': [3, 6],
-                'classifier__learning_rate': [0.01, 0.1],
-                'classifier__subsample': [0.8, 1.0],
-                'classifier__colsample_bytree': [0.8, 1.0]
-            }
-        }
-    }
+# Evaluate optimized model on validation set
+print("\nOptimized Random Forest model performance on validation set:")
+optimized_rf_val_metrics = evaluate_model(optimized_rf, X_val_scaled, y_val, 'rf', 'Optimized RF Validation')
 
-    # Store results for each model
-    nested_cv_results = {}
-    best_models = {}
+# Evaluate optimized model on test set
+print("\nOptimized Random Forest model performance on test set:")
+optimized_rf_test_metrics = evaluate_model(optimized_rf, X_test_scaled, y_test, 'rf', 'Optimized RF Test')
 
-    for model_name, config in models_config.items():
-        print(f"\n{'-' * 50}")
-        print(f"Processing {model_name}")
-        print(f"{'-' * 50}")
-
-        pipeline = config['pipeline']
-        param_grid = config['param_grid']
-
-        # Nested CV scores storage
-        nested_scores = []
-        fold_best_params = []
-
-        # Outer CV loop
-        for fold, (train_idx, val_idx) in enumerate(outer_cv.split(X_train, y_train)):
-            print(f"Outer CV Fold {fold + 1}/5")
-
-            # Split data for this fold
-            X_train_fold = X_train.iloc[train_idx]
-            X_val_fold = X_train.iloc[val_idx]
-            y_train_fold = y_train.iloc[train_idx]
-            y_val_fold = y_train.iloc[val_idx]
-
-            # Inner CV: Grid search for hyperparameter optimization
-            grid_search = GridSearchCV(
-                estimator=pipeline,
-                param_grid=param_grid,
-                cv=inner_cv,
-                scoring='roc_auc',
-                n_jobs=-1,
-                verbose=0
-            )
-
-            # Fit grid search on training fold
-            grid_search.fit(X_train_fold, y_train_fold)
-
-            # Evaluate best model on validation fold
-            best_model_fold = grid_search.best_estimator_
-            val_score = roc_auc_score(y_val_fold, best_model_fold.predict_proba(X_val_fold)[:, 1])
-
-            nested_scores.append(val_score)
-            fold_best_params.append(grid_search.best_params_)
-
-            print(f"  Best params: {grid_search.best_params_}")
-            print(f"  Validation AUC: {val_score:.4f}")
-
-        # Calculate nested CV performance
-        mean_score = np.mean(nested_scores)
-        std_score = np.std(nested_scores)
-
-        print(f"\n{model_name} Nested CV Results:")
-        print(f"Mean AUC: {mean_score:.4f} (+/- {std_score * 2:.4f})")
-        print(f"Individual fold scores: {[f'{score:.4f}' for score in nested_scores]}")
-
-        # Store results
-        nested_cv_results[model_name] = {
-            'mean_score': mean_score,
-            'std_score': std_score,
-            'fold_scores': nested_scores,
-            'fold_params': fold_best_params
-        }
-
-        # Train final model on entire training set with best average parameters
-        # Find most common parameter choices across folds
-        final_grid_search = GridSearchCV(
-            estimator=pipeline,
-            param_grid=param_grid,
-            cv=inner_cv,
-            scoring='roc_auc',
-            n_jobs=-1,
-            verbose=0
-        )
-
-        final_grid_search.fit(X_train, y_train)
-        best_models[model_name] = final_grid_search.best_estimator_
-
-        # Save parameters
-        save_parameters(f'results/best_{model_name.lower().replace(" ", "_")}_parameters.txt',
-                        final_grid_search.best_params_, model_name)
-
-    return nested_cv_results, best_models
-
+# Save convergence curve
+save_convergence_curve(rf_ssa.fitness_history, 'rf', 'Random Forest Optimization')
 
 # =============================================================
-# Final Model Evaluation on Test Set
+# 2. SSA-Optimized XGBoost Model
 # =============================================================
+# Calculate scale_pos_weight parameter
+counter = Counter(y_train_resampled)
+scale_pos_weight = counter[0] / counter[1] if 1 in counter and 0 in counter else 1
 
-def evaluate_final_models(best_models, X_train, X_test, y_train, y_test, feature_names):
-    """Evaluate final models on held-out test set"""
+# Define XGBoost fitness function using new loss function
+def xgb_fitness(position):
+    """Calculate XGBoost loss function with given parameters"""
+    n_estimators = int(position[0])
+    max_depth = int(position[1])
+    learning_rate = position[2]
+    gamma = position[3]
+    min_child_weight = position[4]
 
-    print("\n" + "=" * 60)
-    print("FINAL MODEL EVALUATION ON HELD-OUT TEST SET")
-    print("=" * 60)
+    # Create XGBoost model
+    xgb_model = xgb.XGBClassifier(
+        n_estimators=n_estimators,
+        max_depth=max_depth,
+        learning_rate=learning_rate,
+        gamma=gamma,
+        min_child_weight=min_child_weight,
+        scale_pos_weight=scale_pos_weight,
+        random_state=42,
+        use_label_encoder=False,
+        eval_metric='logloss'
+    )
 
-    final_results = {}
+    # Use 5-fold cross-validation to calculate accuracy and recall
+    acc_scores = cross_val_score(xgb_model, X_train_resampled, y_train_resampled, cv=5, scoring='accuracy')
+    recall_scores = cross_val_score(xgb_model, X_train_resampled, y_train_resampled, cv=5, scoring='recall')
+    
+    # Calculate mean accuracy and recall
+    mean_accuracy = np.mean(acc_scores)
+    mean_recall = np.mean(recall_scores)
+    
+    # Calculate new loss function
+    loss = (1 - mean_recall) * 0.8 + (1 - mean_accuracy) * 0.2
+    return loss
 
-    for model_name, pipeline in best_models.items():
-        print(f"\nEvaluating {model_name}...")
+# SSA parameter settings for XGBoost
+print("\nStarting XGBoost parameter optimization...")
+xgb_ssa = SalpSwarmOptimizer(
+    n_salps=10,
+    dim=5,
+    bounds=[(50, 200), (3, 10), (0.01, 0.3), (0, 1), (1, 10)],  # n_estimators, max_depth, learning_rate, gamma, min_child_weight
+    max_iter=20
+)
 
-        # Evaluate on test set
-        test_metrics, test_pred, fitted_pipeline = evaluate_model_final(
-            pipeline, X_train, X_test, y_train, y_test, model_name
-        )
+# Train initial model with default parameters
+initial_xgb = xgb.XGBClassifier(
+    scale_pos_weight=scale_pos_weight,
+    random_state=42,
+    use_label_encoder=False,
+    eval_metric='logloss'
+)
+initial_xgb.fit(X_train_resampled, y_train_resampled)
 
-        final_results[model_name] = {
-            'metrics': test_metrics,
-            'predictions': test_pred,
-            'pipeline': fitted_pipeline
-        }
+# Save initial parameters
+initial_xgb_params = initial_xgb.get_params()
+save_hyperparameters(initial_xgb_params, 'initial_xgb_params.json')
 
-        # Save metrics
-        save_evaluation_metrics(f'results/{model_name.lower().replace(" ", "_")}_final_metrics.txt',
-                                test_metrics, "Final Test Set")
+# Evaluate initial model on validation set
+print("\nInitial XGBoost model performance on validation set:")
+initial_xgb_val_metrics = evaluate_model(initial_xgb, X_val_scaled, y_val, 'xgb', 'Initial XGBoost Validation')
 
-        # Save confusion matrix
-        plot_and_save_confusion_matrix(
-            y_test, test_pred,
-            f'results/{model_name.lower().replace(" ", "_")}_confusion_matrix.jpg',
-            f'{model_name} - Test Set Confusion Matrix'
-        )
+# Evaluate initial model on test set
+print("\nInitial XGBoost model performance on test set:")
+initial_xgb_test_metrics = evaluate_model(initial_xgb, X_test_scaled, y_test, 'xgb', 'Initial XGBoost Test')
 
-        # Save model
-        model_filename = f'results/{model_name.lower().replace(" ", "_")}_final_model.pkl'
-        joblib.dump(fitted_pipeline, model_filename)
-        print(f"Model saved to {model_filename}")
+# Execute optimization
+start_time = time.time()
+best_xgb_params, best_xgb_fitness = xgb_ssa.optimize(xgb_fitness)
+elapsed_time = time.time() - start_time
 
-        # Feature importance (for tree-based models)
-        if hasattr(fitted_pipeline.named_steps['classifier'], 'feature_importances_'):
-            # Get selected features
-            selected_features_mask = fitted_pipeline.named_steps['feature_selection'].get_support()
-            selected_feature_names = [feature_names[i] for i in range(len(feature_names)) if selected_features_mask[i]]
+# Parse best parameters
+n_estimators_xgb = int(best_xgb_params[0])
+max_depth_xgb = int(best_xgb_params[1])
+learning_rate = best_xgb_params[2]
+gamma = best_xgb_params[3]
+min_child_weight = best_xgb_params[4]
 
-            importance_df = pd.DataFrame({
-                'feature': selected_feature_names,
-                'importance': fitted_pipeline.named_steps['classifier'].feature_importances_
-            }).sort_values('importance', ascending=False)
+# Save optimized parameters
+optimized_xgb_params = {
+    'n_estimators': n_estimators_xgb,
+    'max_depth': max_depth_xgb,
+    'learning_rate': learning_rate,
+    'gamma': gamma,
+    'min_child_weight': min_child_weight,
+    'fitness': best_xgb_fitness
+}
+save_hyperparameters(optimized_xgb_params, 'optimized_xgb_params.json')
 
-            # Save feature importance
-            importance_filename = f'results/{model_name.lower().replace(" ", "_")}_feature_importance.csv'
-            importance_df.to_csv(importance_filename, index=False)
+print("\nXGBoost optimization completed!")
+print(f"Optimization time: {elapsed_time:.2f} seconds")
+print(f"Best parameters: n_estimators={n_estimators_xgb}, max_depth={max_depth_xgb}, "
+      f"learning_rate={learning_rate:.4f}, gamma={gamma:.4f}, min_child_weight={min_child_weight:.1f}")
+print(f"Best fitness value: {best_xgb_fitness:.4f}")
 
-            # Plot feature importance
-            plt.figure(figsize=(10, 8))
-            top_features = importance_df.head(min(20, len(importance_df)))
-            plt.barh(range(len(top_features)), top_features['importance'])
-            plt.yticks(range(len(top_features)), top_features['feature'])
-            plt.xlabel('Feature Importance')
-            plt.title(f'{model_name} - Feature Importance (Selected Features Only)')
-            plt.gca().invert_yaxis()
-            plt.tight_layout()
-            plt.savefig(f'results/{model_name.lower().replace(" ", "_")}_feature_importance.jpg', dpi=400)
-            plt.close()
+# Train final model with best parameters
+optimized_xgb = xgb.XGBClassifier(
+    n_estimators=n_estimators_xgb,
+    max_depth=max_depth_xgb,
+    learning_rate=learning_rate,
+    gamma=gamma,
+    min_child_weight=min_child_weight,
+    scale_pos_weight=scale_pos_weight,
+    random_state=42,
+    use_label_encoder=False,
+    eval_metric='logloss'
+)
+optimized_xgb.fit(X_train_resampled, y_train_resampled)
 
-    return final_results
+# Evaluate optimized model on validation set
+print("\nOptimized XGBoost model performance on validation set:")
+optimized_xgb_val_metrics = evaluate_model(optimized_xgb, X_val_scaled, y_val, 'xgb', 'Optimized XGBoost Validation')
 
+# Evaluate optimized model on test set
+print("\nOptimized XGBoost model performance on test set:")
+optimized_xgb_test_metrics = evaluate_model(optimized_xgb, X_test_scaled, y_test, 'xgb', 'Optimized XGBoost Test')
 
-# =============================================================
-# Results Summary and Comparison
-# =============================================================
+# Save convergence curve
+save_convergence_curve(xgb_ssa.fitness_history, 'xgb', 'XGBoost Optimization')
 
-def summarize_results(nested_cv_results, final_results):
-    """Summarize and compare all results"""
+# Save all evaluation results
+all_metrics = {
+    'initial_rf_validation': initial_rf_val_metrics,
+    'initial_rf_test': initial_rf_test_metrics,
+    'optimized_rf_validation': optimized_rf_val_metrics,
+    'optimized_rf_test': optimized_rf_test_metrics,
+    'initial_xgb_validation': initial_xgb_val_metrics,
+    'initial_xgb_test': initial_xgb_test_metrics,
+    'optimized_xgb_validation': optimized_xgb_val_metrics,
+    'optimized_xgb_test': optimized_xgb_test_metrics
+}
 
-    print("\n" + "=" * 60)
-    print("COMPREHENSIVE RESULTS SUMMARY")
-    print("=" * 60)
+with open(os.path.join(results_dir, 'all_metrics.json'), 'w') as f:
+    json.dump(all_metrics, f, indent=4)
 
-    # Create comparison dataframes
-    cv_comparison = pd.DataFrame({
-        model: {
-            'CV_Mean_AUC': results['mean_score'],
-            'CV_Std_AUC': results['std_score']
-        }
-        for model, results in nested_cv_results.items()
-    }).T
-
-    test_comparison = pd.DataFrame({
-        model: results['metrics']
-        for model, results in final_results.items()
-    }).T
-
-    # Combine results
-    full_comparison = pd.concat([cv_comparison, test_comparison], axis=1)
-
-    print("\nNested Cross-Validation vs Test Set Performance:")
-    print(full_comparison.round(4))
-
-    # Save comparison
-    full_comparison.to_csv('results/comprehensive_model_comparison.csv')
-
-    # Determine best model
-    best_model_cv = cv_comparison['CV_Mean_AUC'].idxmax()
-    best_model_test = test_comparison['auc'].idxmax()
-
-    print(f"\nBest model by nested CV: {best_model_cv} (AUC: {cv_comparison.loc[best_model_cv, 'CV_Mean_AUC']:.4f})")
-    print(f"Best model by test set: {best_model_test} (AUC: {test_comparison.loc[best_model_test, 'auc']:.4f})")
-
-    # Check for overfitting
-    print("\nOverfitting Analysis:")
-    for model in nested_cv_results.keys():
-        cv_score = cv_comparison.loc[model, 'CV_Mean_AUC']
-        test_score = test_comparison.loc[model, 'auc']
-        difference = cv_score - test_score
-        print(f"{model}: CV AUC = {cv_score:.4f}, Test AUC = {test_score:.4f}, Difference = {difference:.4f}")
-        if abs(difference) > 0.05:
-            print(f"  WARNING: Possible overfitting detected for {model}")
-
-    return full_comparison
-
-
-# =============================================================
-# Main Execution Pipeline
-# =============================================================
-
-def main():
-    """Main execution function"""
-    print("=" * 60)
-    print("MACHINE LEARNING PIPELINE WITH PROPER DATA LEAKAGE PREVENTION")
-    print("=" * 60)
-    print("This pipeline uses:")
-    print("1. Proper train/test split")
-    print("2. Nested cross-validation")
-    print("3. All preprocessing within CV folds")
-    print("4. Final evaluation on held-out test set")
-
-    # Step 1: Load and split data
-    X_train, X_test, y_train, y_test, feature_names = load_and_split_data()
-
-    # Step 2: Perform nested cross-validation with grid search
-    start_time = time.time()
-    nested_cv_results, best_models = perform_nested_cv_gridsearch(X_train, y_train, feature_names)
-    cv_time = time.time() - start_time
-    print(f"\nNested CV completed in {cv_time:.2f} seconds")
-
-    # Step 3: Final evaluation on test set
-    final_results = evaluate_final_models(best_models, X_train, X_test, y_train, y_test, feature_names)
-
-    # Step 4: Comprehensive results summary
-    comparison_df = summarize_results(nested_cv_results, final_results)
-
-    print(f"\n{'=' * 60}")
-    print("PIPELINE COMPLETED SUCCESSFULLY!")
-    print("=" * 60)
-    print("✅ No data leakage: All preprocessing done within CV folds")
-    print("✅ Unbiased estimates: Nested cross-validation used")
-    print("✅ Proper validation: Final test on completely held-out data")
-    print("✅ Results saved to 'results/' folder")
-    print("\nCheck the 'results' folder for detailed outputs including:")
-    print("- Model parameters and performance metrics")
-    print("- Confusion matrices and feature importance plots")
-    print("- Trained model files (.pkl)")
-    print("- Comprehensive comparison results")
-
-
-if __name__ == "__main__":
-    main()
+print(f"\nAll results saved to directory: {results_dir}")
+print("\nSummary:")
+print("="*60)
+print("Random Forest Results:")
+print(f"Initial model (Test): Accuracy={initial_rf_test_metrics['accuracy']:.4f}, Recall={initial_rf_test_metrics['recall']:.4f}")
+print(f"Optimized model (Test): Accuracy={optimized_rf_test_metrics['accuracy']:.4f}, Recall={optimized_rf_test_metrics['recall']:.4f}")
+print("\nXGBoost Results:")
+print(f"Initial model (Test): Accuracy={initial_xgb_test_metrics['accuracy']:.4f}, Recall={initial_xgb_test_metrics['recall']:.4f}")
+print(f"Optimized model (Test): Accuracy={optimized_xgb_test_metrics['accuracy']:.4f}, Recall={optimized_xgb_test_metrics['recall']:.4f}")
+print("="*60)
